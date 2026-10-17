@@ -1,30 +1,46 @@
 import socket
 import threading
+import uuid
 
-from bunker.network.protocol import ProtocolError, decode_message, encode_message
+from bunker.game.room import RoomError, RoomManager
+from bunker.network.protocol import (
+    ProtocolError,
+    decode_message,
+    encode_message,
+)
 
 
 class BunkerServer:
-    """TCP server for the Bunker LAN messaging prototype."""
+    """Manage TCP connections and a shared game lobby."""
 
     def __init__(
         self,
         host: str = "127.0.0.1",
         port: int = 0,
+        max_players: int = 8,
+        min_players: int = 3,
     ) -> None:
-        """Initialize the server configuration.
+        """Initialize the server and its room.
 
         Args:
-            host: Local interface address to bind to.
-            port: Port to listen on. Zero selects an available port.
+            host: Network interface address to listen on.
+            port: TCP port; zero selects an available port.
+            max_players: Maximum number of players in the room.
+            min_players: Minimum number required to start.
         """
         self.host = host
         self.port = port
-        self._server_socket: socket.socket | None = None
-        self._accept_thread: threading.Thread | None = None
+        self.room = RoomManager(max_players, min_players)
+
+        self._server_socket = None
+        self._accept_thread = None
         self._stop_event = threading.Event()
-        self._clients: set[socket.socket] = set()
+
+        self._clients = set()
+        self._client_players = {}
+        self._send_locks = {}
         self._clients_lock = threading.Lock()
+        self._state_lock = threading.RLock()
 
     @property
     def address(self) -> tuple[str, int]:
@@ -34,7 +50,7 @@ class BunkerServer:
             A tuple containing the bound host and port.
 
         Raises:
-            RuntimeError: If the server has not been started.
+            RuntimeError: If the server is not running.
         """
         if self._server_socket is None:
             raise RuntimeError("Server is not running.")
@@ -43,20 +59,26 @@ class BunkerServer:
         return host, port
 
     def start(self) -> None:
-        """Start listening for TCP connections.
+        """Start accepting incoming TCP connections.
 
         Raises:
-            OSError: If the socket cannot be created or bound.
             RuntimeError: If the server is already running.
+            OSError: If the listening socket cannot be created.
         """
-        if self._accept_thread is not None:
-            if self._accept_thread.is_alive():
-                raise RuntimeError("Server is already running.")
+        if self._accept_thread is not None and self._accept_thread.is_alive():
+            raise RuntimeError("Server is already running.")
 
-        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket = socket.socket(
+            socket.AF_INET,
+            socket.SOCK_STREAM,
+        )
 
         try:
-            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server_socket.setsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_REUSEADDR,
+                1,
+            )
             server_socket.bind((self.host, self.port))
             server_socket.listen()
             server_socket.settimeout(0.2)
@@ -66,15 +88,16 @@ class BunkerServer:
 
         self._server_socket = server_socket
         self._stop_event.clear()
+
         self._accept_thread = threading.Thread(
             target=self._accept_connections,
-            name="bunker-server-accept",
+            args=(server_socket,),
             daemon=True,
         )
         self._accept_thread.start()
 
     def stop(self) -> None:
-        """Stop the server and close active client connections."""
+        """Stop the server and close connected clients."""
         self._stop_event.set()
 
         server_socket = self._server_socket
@@ -95,16 +118,21 @@ class BunkerServer:
                 connection.close()
 
         thread = self._accept_thread
-        if thread is not None and thread is not threading.current_thread():
+        if thread is not None:
             thread.join(timeout=1)
 
         self._accept_thread = None
 
-    def _accept_connections(self) -> None:
-        """Accept clients and start a handler for each connection."""
-        server_socket = self._server_socket
+    def _accept_connections(
+        self,
+        server_socket: socket.socket,
+    ) -> None:
+        """Accept clients and start their message handlers.
 
-        while server_socket is not None and not self._stop_event.is_set():
+        Args:
+            server_socket: The listening TCP socket.
+        """
+        while not self._stop_event.is_set():
             try:
                 connection, _ = server_socket.accept()
             except socket.timeout:
@@ -114,19 +142,60 @@ class BunkerServer:
 
             with self._clients_lock:
                 self._clients.add(connection)
+                self._send_locks[connection] = threading.Lock()
 
             threading.Thread(
                 target=self._handle_client,
                 args=(connection,),
-                name="bunker-client-handler",
                 daemon=True,
             ).start()
 
-    def _handle_client(self, connection: socket.socket) -> None:
-        """Receive messages and send responses to one client.
+    def _send_to_client(
+        self,
+        connection: socket.socket,
+        message: dict,
+    ) -> bool:
+        """Send one JSON message to a connected client.
 
         Args:
-            connection: An established TCP connection.
+            connection: Client socket.
+            message: Message dictionary.
+
+        Returns:
+            True if sending succeeded, otherwise False.
+        """
+        with self._clients_lock:
+            send_lock = self._send_locks.get(connection)
+
+        if send_lock is None:
+            return False
+
+        try:
+            payload = encode_message(message)
+            with send_lock:
+                connection.sendall(payload)
+            return True
+        except (OSError, ProtocolError):
+            return False
+
+    def _broadcast_lobby_state(self) -> None:
+        """Send the current public room state to every client."""
+        if self._stop_event.is_set():
+            return
+
+        state = self.room.get_lobby_state()
+
+        with self._clients_lock:
+            clients = list(self._clients)
+
+        for connection in clients:
+            self._send_to_client(connection, state)
+
+    def _handle_client(self, connection: socket.socket) -> None:
+        """Read and process messages from one client.
+
+        Args:
+            connection: An established client socket.
         """
         try:
             with connection.makefile("rb") as stream:
@@ -134,38 +203,214 @@ class BunkerServer:
                     try:
                         request = decode_message(raw_message)
                     except ProtocolError as exc:
-                        response = {
-                            "type": "error",
-                            "message": str(exc),
-                        }
-                    else:
-                        response = self._build_response(request)
+                        self._send_to_client(
+                            connection,
+                            {
+                                "type": "error",
+                                "message": str(exc),
+                            },
+                        )
+                        continue
 
-                    connection.sendall(encode_message(response))
-        except OSError:
+                    if not self._process_message(connection, request):
+                        break
+        except (OSError, ValueError):
             pass
         finally:
-            with self._clients_lock:
-                self._clients.discard(connection)
+            self._remove_client(connection)
             connection.close()
 
-    @staticmethod
-    def _build_response(request: dict) -> dict:
-        """Build a response to a valid request.
+    def _process_message(
+        self,
+        connection: socket.socket,
+        request: dict,
+    ) -> bool:
+        """Process a client request.
 
         Args:
-            request: A decoded request message.
+            connection: Socket that sent the request.
+            request: Decoded JSON message.
 
         Returns:
-            A pong response or an error response.
+            False if the client should disconnect, otherwise True.
         """
-        if request["type"] == "ping":
-            return {
-                "type": "pong",
-                "message": request.get("message", ""),
-            }
+        message_type = request["type"]
 
-        return {
-            "type": "error",
-            "message": f"Unsupported message type: {request['type']}",
-        }
+        if message_type == "ping":
+            self._send_to_client(
+                connection,
+                {
+                    "type": "pong",
+                    "message": request.get("message", ""),
+                },
+            )
+            return True
+
+        if message_type == "join":
+            return self._join_client(connection, request)
+
+        if message_type == "ready":
+            with self._state_lock:
+                player_id = self._get_player_id(connection)
+
+                if player_id is None:
+                    self._send_error(
+                        connection,
+                        "Join the room before sending actions.",
+                    )
+                    return True
+
+                try:
+                    self.room.set_ready(
+                        player_id,
+                        request.get("ready"),
+                    )
+                except RoomError as exc:
+                    self._send_error(connection, str(exc))
+                    return True
+
+                self._broadcast_lobby_state()
+            return True
+
+        if message_type == "start":
+            with self._state_lock:
+                player_id = self._get_player_id(connection)
+
+                if player_id is None:
+                    self._send_error(
+                        connection,
+                        "Join the room before starting the game.",
+                    )
+                    return True
+
+                try:
+                    self.room.start_game(player_id)
+                except RoomError as exc:
+                    self._send_error(connection, str(exc))
+                    return True
+
+                self._broadcast_lobby_state()
+            return True
+
+        if message_type == "leave":
+            self._send_to_client(connection, {"type": "left"})
+            return False
+
+        self._send_error(
+            connection,
+            f"Unsupported message type: {message_type}",
+        )
+        return True
+
+    def _join_client(
+        self,
+        connection: socket.socket,
+        request: dict,
+    ) -> bool:
+        """Register a client and notify all room participants.
+
+        Args:
+            connection: Socket requesting to join.
+            request: Join request containing the nickname.
+
+        Returns:
+            True to keep the connection open.
+        """
+        with self._state_lock:
+            if self._get_player_id(connection) is not None:
+                self._send_error(
+                    connection,
+                    "This connection has already joined.",
+                )
+                return True
+
+            nickname = request.get("nickname")
+
+            if not isinstance(nickname, str):
+                self._send_error(
+                    connection,
+                    "Nickname must be a string.",
+                )
+                return True
+
+            player_id = uuid.uuid4().hex
+
+            try:
+                player = self.room.add_player(
+                    player_id,
+                    nickname,
+                )
+            except RoomError as exc:
+                self._send_error(connection, str(exc))
+                return True
+
+            with self._clients_lock:
+                self._client_players[connection] = player_id
+
+            self._send_to_client(
+                connection,
+                {
+                    "type": "welcome",
+                    "player_id": player_id,
+                    "host_id": (player_id if player["is_host"] else None),
+                },
+            )
+            self._broadcast_lobby_state()
+
+        return True
+
+    def _get_player_id(
+        self,
+        connection: socket.socket,
+    ) -> str | None:
+        """Find the player associated with a connection.
+
+        Args:
+            connection: Client socket.
+
+        Returns:
+            Player ID or None if the client has not joined.
+        """
+        with self._clients_lock:
+            return self._client_players.get(connection)
+
+    def _send_error(
+        self,
+        connection: socket.socket,
+        message: str,
+    ) -> None:
+        """Send a structured error message to a client.
+
+        Args:
+            connection: Client socket.
+            message: Human-readable error description.
+        """
+        self._send_to_client(
+            connection,
+            {
+                "type": "error",
+                "message": message,
+            },
+        )
+
+    def _remove_client(
+        self,
+        connection: socket.socket,
+    ) -> None:
+        """Remove a disconnected client and update the lobby."""
+        with self._state_lock:
+            with self._clients_lock:
+                self._clients.discard(connection)
+                self._send_locks.pop(connection, None)
+                player_id = self._client_players.pop(
+                    connection,
+                    None,
+                )
+
+            if player_id is not None:
+                try:
+                    self.room.remove_player(player_id)
+                except RoomError:
+                    pass
+
+                self._broadcast_lobby_state()

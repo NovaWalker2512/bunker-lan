@@ -2,6 +2,8 @@ import socket
 import threading
 import uuid
 
+from bunker.game.game import GameError, GameManager
+
 from bunker.game.room import RoomError, RoomManager
 from bunker.network.protocol import (
     ProtocolError,
@@ -31,6 +33,7 @@ class BunkerServer:
         self.host = host
         self.port = port
         self.room = RoomManager(max_players, min_players)
+        self.game: GameManager | None = None
 
         self._server_socket = None
         self._accept_thread = None
@@ -191,6 +194,19 @@ class BunkerServer:
         for connection in clients:
             self._send_to_client(connection, state)
 
+    def _broadcast_game_state(self) -> None:
+        """Отправляет состояние игровой партии всем подключённым клиентам."""
+        if self._stop_event.is_set() or self.game is None:
+            return
+
+        state = self.game.get_state()
+
+        with self._clients_lock:
+            clients = list(self._clients)
+
+        for connection in clients:
+            self._send_to_client(connection, state)
+
     def _handle_client(self, connection: socket.socket) -> None:
         """Read and process messages from one client.
 
@@ -279,17 +295,94 @@ class BunkerServer:
                 if player_id is None:
                     self._send_error(
                         connection,
-                        "Join the room before starting the game.",
+                        "Сначала необходимо присоединиться к комнате.",
+                    )
+                    return True
+
+                current_state = self.room.get_lobby_state()
+
+                if len(current_state["players"]) < 3:
+                    self._send_error(
+                        connection,
+                        "Для начала партии необходимо минимум 3 игрока.",
                     )
                     return True
 
                 try:
-                    self.room.start_game(player_id)
-                except RoomError as exc:
+                    lobby_state = self.room.start_game(player_id)
+
+                    game = GameManager(bunker_capacity=2)
+                    game.start(
+                        [
+                            player["player_id"]
+                            for player in lobby_state["players"]
+                        ]
+                    )
+                except (RoomError, GameError) as exc:
                     self._send_error(connection, str(exc))
                     return True
 
-                self._broadcast_lobby_state()
+                self.game = game
+                self._broadcast_game_state()
+
+            return True
+
+        if message_type == "reveal":
+            with self._state_lock:
+                player_id = self._get_player_id(connection)
+
+                if player_id is None:
+                    self._send_error(
+                        connection,
+                        "Сначала необходимо присоединиться к комнате.",
+                    )
+                    return True
+
+                if self.game is None:
+                    self._send_error(
+                        connection,
+                        "Партия ещё не началась.",
+                    )
+                    return True
+
+                try:
+                    self.game.reveal_attribute(player_id)
+                except GameError as exc:
+                    self._send_error(connection, str(exc))
+                    return True
+
+                self._broadcast_game_state()
+
+            return True
+
+        if message_type == "vote":
+            with self._state_lock:
+                player_id = self._get_player_id(connection)
+
+                if player_id is None:
+                    self._send_error(
+                        connection,
+                        "Сначала необходимо присоединиться к комнате.",
+                    )
+                    return True
+
+                if self.game is None:
+                    self._send_error(
+                        connection,
+                        "Партия ещё не началась.",
+                    )
+                    return True
+
+                target_id = request.get("target_id")
+
+                try:
+                    self.game.cast_vote(player_id, target_id)
+                except GameError as exc:
+                    self._send_error(connection, str(exc))
+                    return True
+
+                self._broadcast_game_state()
+
             return True
 
         if message_type == "leave":

@@ -58,6 +58,7 @@ class GameManager:
 
         self._round_index = 0
         self._phase = "waiting"
+        self._history: list[dict] = []
 
     def start(self, player_ids: list[str]) -> dict:
         """Создаёт персонажей и запускает первую фазу партии.
@@ -113,6 +114,13 @@ class GameManager:
                 for player_id in self._players
             }
             self._phase = "reveal"
+            self._history.append(
+                {
+                    "type": "started",
+                    "round": 1,
+                    "message": "Партия началась.",
+                }
+            )
 
             return self.get_state()
 
@@ -148,6 +156,15 @@ class GameManager:
                 )
 
             self._revealed.add(card_key)
+            self._history.append(
+                {
+                    "type": "reveal",
+                    "round": self._round_index + 1,
+                    "player_id": player_id,
+                    "category": CATEGORY_LABELS[category],
+                    "value": self._characters[player_id][category],
+                }
+            )
 
             active_players = self._active_players()
 
@@ -257,6 +274,7 @@ class GameManager:
                 "votes_received": len(self._votes),
                 "tie_candidates": list(self._tie_candidates),
                 "winners": list(self._winners),
+                "history": [dict(event) for event in self._history],
             }
 
     def _ensure_active_player(self, player_id: str) -> None:
@@ -301,12 +319,28 @@ class GameManager:
 
         if len(candidates) > 1 and self._phase != "revote":
             self._tie_candidates = candidates
+            self._history.append(
+                {
+                    "type": "tie",
+                    "round": self._round_index + 1,
+                    "player_ids": list(candidates),
+                    "message": "Ничья. Необходимо повторное голосование.",
+                }
+            )
             self._votes.clear()
             self._phase = "revote"
             return
 
         eliminated_id = self._rng.choice(candidates)
         self._eliminated.add(eliminated_id)
+        self._history.append(
+            {
+                "type": "elimination",
+                "round": self._round_index + 1,
+                "player_id": eliminated_id,
+                "votes": counts[eliminated_id],
+            }
+        )
 
         self._votes.clear()
         self._tie_candidates.clear()
@@ -316,6 +350,14 @@ class GameManager:
         if len(active_players) <= self.bunker_capacity:
             self._phase = "finished"
             self._winners = active_players
+            self._history.append(
+                {
+                    "type": "finished",
+                    "round": self._round_index + 1,
+                    "winners": list(active_players),
+                    "message": "Партия завершена.",
+                }
+            )
             return
 
         self._round_index = (

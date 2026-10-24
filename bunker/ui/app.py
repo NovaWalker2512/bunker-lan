@@ -27,6 +27,12 @@ class BunkerApplication(tk.Tk):
         self.players: list[dict] = []
 
         self.is_host = False
+        self.in_game_screen = False
+        self.game_state: dict | None = None
+        self.game_phase: str | None = None
+        self._vote_targets: list[str] = []
+        self.vote_submitted = False
+        self.reveal_pending = False
         self.room_port = 5000
         self.connecting = False
         self.connect_buttons: list[ttk.Button] = []
@@ -41,6 +47,7 @@ class BunkerApplication(tk.Tk):
 
     def _show_home(self) -> None:
         """Создаёт экран создания комнаты и подключения."""
+        self.in_game_screen = False
         self._clear_screen()
         self.connect_buttons = []
 
@@ -326,6 +333,7 @@ class BunkerApplication(tk.Tk):
 
     def _show_lobby(self) -> None:
         """Создаёт экран комнаты ожидания."""
+        self.in_game_screen = False
         self._clear_screen()
 
         frame = ttk.Frame(self, padding=24)
@@ -430,6 +438,13 @@ class BunkerApplication(tk.Tk):
             self._update_lobby(message)
             return
 
+        if message_type == "game_state":
+            if not self.in_game_screen:
+                self._show_game()
+
+            self._update_game(message)
+            return
+
         if message_type == "error":
             messagebox.showerror(
                 "Ошибка комнаты",
@@ -507,6 +522,349 @@ class BunkerApplication(tk.Tk):
         self.start_button.configure(
             state="normal" if can_start else "disabled"
         )
+
+    def _show_game(self) -> None:
+        """Создаёт графический экран игровой партии."""
+        self._clear_screen()
+        self.in_game_screen = True
+        self.game_phase = None
+        self.vote_submitted = False
+        self.reveal_pending = False
+
+        frame = ttk.Frame(self, padding=20)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(
+            frame,
+            text="Бункер — игровая партия",
+            font=("Segoe UI", 20, "bold"),
+        ).pack(pady=(0, 10))
+
+        self.game_status_label = ttk.Label(
+            frame,
+            text="Получаем состояние партии...",
+            wraplength=700,
+            justify="center",
+        )
+        self.game_status_label.pack(fill="x", pady=5)
+
+        self.game_category_label = ttk.Label(
+            frame,
+            text="",
+            font=("Segoe UI", 12, "bold"),
+        )
+        self.game_category_label.pack(pady=5)
+
+        ttk.Label(
+            frame,
+            text="Игроки и раскрытые характеристики",
+            font=("Segoe UI", 11, "bold"),
+        ).pack(anchor="w", pady=(10, 3))
+
+        self.game_players_list = tk.Listbox(
+            frame,
+            height=12,
+            font=("Segoe UI", 10),
+            activestyle="none",
+        )
+        self.game_players_list.pack(fill="both", expand=True, pady=5)
+
+        ttk.Label(
+            frame,
+            text="История партии",
+            font=("Segoe UI", 11, "bold"),
+        ).pack(anchor="w", pady=(8, 3))
+
+        self.history_list = tk.Listbox(
+            frame,
+            height=5,
+            font=("Segoe UI", 9),
+            activestyle="none",
+        )
+        self.history_list.pack(fill="x", pady=5)
+
+        controls = ttk.Frame(frame)
+        controls.pack(fill="x", pady=10)
+
+        self.reveal_button = ttk.Button(
+            controls,
+            text="Раскрыть характеристику",
+            command=self._reveal_attribute,
+            state="disabled",
+        )
+        self.reveal_button.pack(fill="x", pady=4)
+
+        ttk.Label(
+            controls,
+            text="Кого исключить?",
+        ).pack(anchor="w", pady=(8, 2))
+
+        self.vote_target = ttk.Combobox(
+            controls,
+            state="disabled",
+        )
+        self.vote_target.pack(fill="x", pady=3)
+
+        self.vote_button = ttk.Button(
+            controls,
+            text="Проголосовать",
+            command=self._vote,
+            state="disabled",
+        )
+        self.vote_button.pack(fill="x", pady=4)
+
+        ttk.Button(
+            controls,
+            text="Покинуть игру",
+            command=self._leave_room,
+        ).pack(fill="x", pady=4)
+
+    def _player_name(self, player_id: str) -> str:
+        """Возвращает никнейм игрока по его идентификатору.
+
+        Args:
+            player_id: Идентификатор игрока на сервере.
+
+        Returns:
+            Никнейм игрока или его идентификатор, если имя неизвестно.
+        """
+        for player in self.players:
+            if player.get("player_id") == player_id:
+                return player.get("nickname", player_id)
+
+        return player_id
+
+    def _update_game(self, state: dict) -> None:
+        """Обновляет карточки игроков и доступные игровые действия.
+
+        Args:
+            state: Актуальное публичное состояние партии от сервера.
+        """
+        previous_phase = self.game_phase
+        phase = state.get("phase")
+        self.game_state = state
+
+        if previous_phase != phase:
+            self.vote_submitted = False
+            self.reveal_pending = False
+
+        self.game_phase = phase
+
+        phase_names = {
+            "reveal": "Раунд раскрытия характеристик",
+            "voting": "Голосование за исключение игрока",
+            "revote": "Повторное голосование",
+            "finished": "Партия завершена",
+        }
+
+        status = phase_names.get(phase, "Неизвестная фаза")
+        self.game_status_label.configure(
+            text=f'Раунд {state.get("round", 1)}. {status}'
+        )
+
+        category_label = state.get("category_label", "")
+        if phase == "reveal":
+            self.game_category_label.configure(
+                text=f"Сейчас раскрывается: {category_label}"
+            )
+        else:
+            self.game_category_label.configure(text="")
+
+        self.game_players_list.delete(0, tk.END)
+
+        game_players = state.get("players", [])
+        own_player = None
+
+        for player in game_players:
+            player_id = player["player_id"]
+            nickname = self._player_name(player_id)
+
+            if player_id == self.player_id:
+                own_player = player
+
+            if player.get("eliminated"):
+                self.game_players_list.insert(
+                    tk.END,
+                    f"{nickname} — исключён",
+                )
+            else:
+                self.game_players_list.insert(tk.END, nickname)
+
+            for category, value in player.get("cards", {}).items():
+                self.game_players_list.insert(
+                    tk.END,
+                    f"    {category}: {value}",
+                )
+
+        self.history_list.delete(0, tk.END)
+
+        for event in state.get("history", []):
+            event_type = event.get("type")
+
+            if event_type == "started":
+                text = "Партия началась."
+
+            elif event_type == "reveal":
+                nickname = self._player_name(event["player_id"])
+                text = (
+                    f'Раунд {event["round"]}: {nickname} раскрыл '
+                    f'{event["category"]}: {event["value"]}'
+                )
+
+            elif event_type == "tie":
+                names = ", ".join(
+                    self._player_name(player_id)
+                    for player_id in event["player_ids"]
+                )
+                text = f"Ничья между игроками: {names}. Повторное голосование."
+
+            elif event_type == "elimination":
+                nickname = self._player_name(event["player_id"])
+                text = (
+                    f"Исключён: {nickname}. "
+                    f'Голосов: {event["votes"]}.'
+                )
+
+            elif event_type == "finished":
+                names = ", ".join(
+                    self._player_name(player_id)
+                    for player_id in event["winners"]
+                )
+                text = f"Партия завершена. В бункер проходят: {names}"
+
+            else:
+                continue
+
+            self.history_list.insert(tk.END, text)
+
+        self.history_list.yview_moveto(1.0)
+
+        if phase == "finished":
+            winners = state.get("winners", [])
+            winner_names = [
+                self._player_name(player_id)
+                for player_id in winners
+            ]
+
+            self.game_category_label.configure(
+                text="В бункер проходят: " + ", ".join(winner_names)
+            )
+
+        already_revealed = (
+                own_player is not None
+                and category_label in own_player.get("cards", {})
+        )
+
+        can_reveal = (
+                phase == "reveal"
+                and not already_revealed
+                and not self.reveal_pending
+        )
+
+        self.reveal_button.configure(
+            state="normal" if can_reveal else "disabled"
+        )
+
+        active_ids = set(state.get("active_player_ids", []))
+        tie_candidates = set(state.get("tie_candidates", []))
+
+        vote_targets = [
+            player["player_id"]
+            for player in game_players
+            if (
+                    player["player_id"] in active_ids
+                    and player["player_id"] != self.player_id
+                    and (
+                            phase != "revote"
+                            or player["player_id"] in tie_candidates
+                    )
+            )
+        ]
+
+        self._vote_targets = vote_targets
+
+        target_names = [
+            self._player_name(player_id)
+            for player_id in vote_targets
+        ]
+
+        previous_index = self.vote_target.current()
+        self.vote_target.configure(values=target_names)
+
+        if target_names:
+            if previous_index < 0 or previous_index >= len(target_names):
+                self.vote_target.current(0)
+        else:
+            self.vote_target.set("")
+
+        can_vote = (
+                phase in ("voting", "revote")
+                and bool(vote_targets)
+                and self.player_id in active_ids
+                and not self.vote_submitted
+        )
+
+        self.vote_target.configure(
+            state="readonly" if can_vote else "disabled"
+        )
+        self.vote_button.configure(
+            state="normal" if can_vote else "disabled"
+        )
+
+    def _reveal_attribute(self) -> None:
+        """Отправляет серверу запрос на раскрытие характеристики."""
+        if self.client is None or self.game_state is None:
+            return
+
+        if self.game_state.get("phase") != "reveal":
+            return
+
+        if self.reveal_pending:
+            return
+
+        try:
+            self.client.send({"type": "reveal"})
+            self.reveal_pending = True
+            self.reveal_button.configure(state="disabled")
+        except (OSError, RuntimeError, ValueError) as exc:
+            messagebox.showerror(
+                "Ошибка отправки",
+                str(exc),
+            )
+
+    def _vote(self) -> None:
+        """Отправляет серверу голос за выбранного игрока."""
+        if self.client is None or self.game_state is None:
+            return
+
+        if self.vote_submitted:
+            return
+
+        selected_index = self.vote_target.current()
+
+        if not 0 <= selected_index < len(self._vote_targets):
+            messagebox.showwarning(
+                "Выбор игрока",
+                "Сначала выбери игрока для голосования.",
+            )
+            return
+
+        target_id = self._vote_targets[selected_index]
+
+        try:
+            self.client.send(
+                {
+                    "type": "vote",
+                    "target_id": target_id,
+                }
+            )
+            self.vote_submitted = True
+            self.vote_button.configure(state="disabled")
+        except (OSError, RuntimeError, ValueError) as exc:
+            messagebox.showerror(
+                "Ошибка отправки",
+                str(exc),
+            )
 
     def _toggle_ready(self) -> None:
         """Переключает готовность текущего игрока."""

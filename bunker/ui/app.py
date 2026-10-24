@@ -569,6 +569,20 @@ class BunkerApplication(tk.Tk):
         )
         self.game_players_list.pack(fill="both", expand=True, pady=5)
 
+        ttk.Label(
+            frame,
+            text="История партии",
+            font=("Segoe UI", 11, "bold"),
+        ).pack(anchor="w", pady=(8, 3))
+
+        self.history_list = tk.Listbox(
+            frame,
+            height=5,
+            font=("Segoe UI", 9),
+            activestyle="none",
+        )
+        self.history_list.pack(fill="x", pady=5)
+
         controls = ttk.Frame(frame)
         controls.pack(fill="x", pady=10)
 
@@ -681,6 +695,49 @@ class BunkerApplication(tk.Tk):
                     tk.END,
                     f"    {category}: {value}",
                 )
+
+        self.history_list.delete(0, tk.END)
+
+        for event in state.get("history", []):
+            event_type = event.get("type")
+
+            if event_type == "started":
+                text = "Партия началась."
+
+            elif event_type == "reveal":
+                nickname = self._player_name(event["player_id"])
+                text = (
+                    f'Раунд {event["round"]}: {nickname} раскрыл '
+                    f'{event["category"]}: {event["value"]}'
+                )
+
+            elif event_type == "tie":
+                names = ", ".join(
+                    self._player_name(player_id)
+                    for player_id in event["player_ids"]
+                )
+                text = f"Ничья между игроками: {names}. Повторное голосование."
+
+            elif event_type == "elimination":
+                nickname = self._player_name(event["player_id"])
+                text = (
+                    f"Исключён: {nickname}. "
+                    f'Голосов: {event["votes"]}.'
+                )
+
+            elif event_type == "finished":
+                names = ", ".join(
+                    self._player_name(player_id)
+                    for player_id in event["winners"]
+                )
+                text = f"Партия завершена. В бункер проходят: {names}"
+
+            else:
+                continue
+
+            self.history_list.insert(tk.END, text)
+
+        self.history_list.yview_moveto(1.0)
 
         if phase == "finished":
             winners = state.get("winners", [])

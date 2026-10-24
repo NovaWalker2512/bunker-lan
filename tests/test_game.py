@@ -176,3 +176,58 @@ def test_invalid_bunker_capacity_is_rejected():
 
     with pytest.raises(ValueError):
         GameManager(bunker_capacity=8)
+
+def test_history_records_reveals_and_elimination():
+    """Проверяет запись раскрытия характеристик и исключения."""
+    game = prepare_game()
+
+    state = game.get_state()
+    reveal_events = [
+        event
+        for event in state["history"]
+        if event["type"] == "reveal"
+    ]
+
+    assert len(reveal_events) == 3
+    assert all("player_id" in event for event in reveal_events)
+    assert all("category" in event for event in reveal_events)
+    assert all("value" in event for event in reveal_events)
+
+    game.cast_vote("p1", "p2")
+    game.cast_vote("p2", "p1")
+    state = game.cast_vote("p3", "p1")
+
+    elimination_events = [
+        event
+        for event in state["history"]
+        if event["type"] == "elimination"
+    ]
+
+    assert len(elimination_events) == 1
+    assert elimination_events[0]["player_id"] == "p1"
+    assert elimination_events[0]["votes"] == 2
+
+    assert any(
+        event["type"] == "finished"
+        for event in state["history"]
+    )
+
+
+def test_history_records_tie_before_revote():
+    """Проверяет запись ничьей перед повторным голосованием."""
+    game = prepare_game()
+
+    game.cast_vote("p1", "p2")
+    game.cast_vote("p2", "p3")
+    state = game.cast_vote("p3", "p1")
+
+    assert state["phase"] == "revote"
+
+    tie_events = [
+        event
+        for event in state["history"]
+        if event["type"] == "tie"
+    ]
+
+    assert len(tie_events) == 1
+    assert set(tie_events[0]["player_ids"]) == {"p1", "p2", "p3"}
